@@ -84,6 +84,8 @@ class TestDDLContent:
         assert "CREATE TABLE IF NOT EXISTS fieldsync.sites" in sql
         assert "store_id" in sql
         assert "uq_sites_store_name" in sql
+        # org_id must lead the UNIQUE so orgs can't collide cross-tenant.
+        assert "UNIQUE (org_id, store_id, client_id, name)" in sql
 
     def test_locations_table_ddl(self) -> None:
         sql = _CREATE_LOCATIONS_SQL
@@ -91,6 +93,7 @@ class TestDDLContent:
         assert "geofence_radius_m" in sql
         assert "REFERENCES fieldsync.sites" in sql
         assert "ON DELETE CASCADE" in sql
+        assert "UNIQUE (org_id, site_id, name)" in sql
 
     def test_ddl_statements_returns_six(self) -> None:
         # 4 base (schema, projects, workday_map, auth_policies)

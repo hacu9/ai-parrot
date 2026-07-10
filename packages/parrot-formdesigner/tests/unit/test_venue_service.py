@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 from parrot_formdesigner.services.venue_service import (
     DuplicateVenueError,
@@ -28,7 +29,15 @@ from parrot_formdesigner.services.venue_service import (
     _INSERT_SITE_SQL,
     _SELECT_LOCATION_SQL,
     _SELECT_SITE_SQL,
+    _is_unique_violation,
 )
+
+
+def _unique_violation_exc() -> Exception:
+    """A fake asyncpg-style error carrying SQLSTATE 23505 (the real signal)."""
+    exc = Exception("duplicate key value violates unique constraint")
+    exc.sqlstate = "23505"  # type: ignore[attr-defined]
+    return exc
 
 
 # ---------------------------------------------------------------------------
@@ -128,10 +137,25 @@ class TestSQLSafety:
         assert "fieldsync.locations" in _INSERT_LOCATION_SQL
         assert "networkninja" not in _INSERT_LOCATION_SQL
 
+    def test_location_insert_is_ownership_checked(self) -> None:
+        # The insert only writes when the parent site belongs to the org.
+        assert "WHERE EXISTS" in _INSERT_LOCATION_SQL
+        assert "FROM fieldsync.sites" in _INSERT_LOCATION_SQL
+        assert "org_id = $3" in _INSERT_LOCATION_SQL
+
     def test_selects_scope_by_org_id(self) -> None:
         # Hard isolation: single-row selects always filter org_id ($2).
         assert "org_id = $2" in _SELECT_SITE_SQL
         assert "org_id = $2" in _SELECT_LOCATION_SQL
+
+
+class TestUniqueViolationDetection:
+    def test_sqlstate_is_authoritative(self) -> None:
+        assert _is_unique_violation(_unique_violation_exc()) is True
+
+    def test_unrelated_error_mentioning_unique_is_not_409(self) -> None:
+        # Regression: the old ``"unique" in str(exc)`` misclassified this.
+        assert _is_unique_violation(ValueError("could not build unique index")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +174,24 @@ class TestModels:
         assert loc.location_type == "kiosk"
         assert loc.latitude is None
         assert loc.geofence_radius_m is None  # None ⇒ geofence disabled
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("latitude", 91.0),
+            ("latitude", -91.0),
+            ("longitude", 181.0),
+            ("longitude", -181.0),
+            ("geofence_radius_m", 0),
+            ("geofence_radius_m", -5),
+        ],
+    )
+    def test_location_geofence_bounds_enforced(self, field: str, value: object) -> None:
+        with pytest.raises(ValidationError):
+            Location(
+                location_id=1, site_id=1, client_id=1, org_id=1, name="k",
+                **{field: value},
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +215,7 @@ class TestCreateSite:
 
     @pytest.mark.asyncio
     async def test_duplicate_site_raises(self) -> None:
-        conn = _make_conn(
-            fetchrow_side_effect=Exception("duplicate key value UniqueViolation")
-        )
+        conn = _make_conn(fetchrow_side_effect=_unique_violation_exc())
         svc = VenueService(_make_pool(conn))
         with pytest.raises(DuplicateVenueError):
             await svc.create_site(
@@ -249,12 +289,22 @@ class TestLocations:
 
     @pytest.mark.asyncio
     async def test_duplicate_location_raises(self) -> None:
-        conn = _make_conn(
-            fetchrow_side_effect=Exception("23505 unique violation")
-        )
+        conn = _make_conn(fetchrow_side_effect=_unique_violation_exc())
         svc = VenueService(_make_pool(conn))
         with pytest.raises(DuplicateVenueError):
             await svc.create_location(site_id=1, client_id=1, org_id=1, name="d")
+
+    @pytest.mark.asyncio
+    async def test_create_location_cross_org_site_rejected(self) -> None:
+        # Ownership-checked insert writes 0 rows when the parent site is not in
+        # the caller's org → fetchrow returns None → SiteNotFoundError (404),
+        # never a silent cross-org write. Regression guard for FEAT-330 #1.
+        conn = _make_conn(fetchrow_result=None)
+        svc = VenueService(_make_pool(conn))
+        with pytest.raises(SiteNotFoundError):
+            await svc.create_location(
+                site_id=999, client_id=1, org_id=7, name="intruder"
+            )
 
     @pytest.mark.asyncio
     async def test_get_location_found(self) -> None:

@@ -25,6 +25,11 @@ from ..services.csrf import issue_form_csrf_token, validate_form_csrf_token
 from ..services.event_dispatcher import apply_schema_overrides, dispatch
 from ..services.registry import FormAlreadyExistsError, FormRegistry
 from ..services.validators import FormValidator
+from ..services.venue_service import (
+    DuplicateVenueError,
+    LocationNotFoundError,
+    SiteNotFoundError,
+)
 from ._utils import _bump_version, _deep_merge, _loc_to_str
 
 if TYPE_CHECKING:
@@ -2063,11 +2068,9 @@ class FormAPIHandler:
                 name=str(name),
                 tenant=tenant,
             )
+        except DuplicateVenueError as exc:
+            return JSONResponse({"error": str(exc)}, status=409)
         except Exception as exc:
-            from ..services.venue_service import DuplicateVenueError
-
-            if isinstance(exc, DuplicateVenueError):
-                return JSONResponse({"error": str(exc)}, status=409)
             self.logger.exception("create_site failed: %s", exc)
             return JSONResponse({"error": "Internal server error"}, status=500)
 
@@ -2163,6 +2166,43 @@ class FormAPIHandler:
         if org_id is None:
             return JSONResponse({"error": "org_id not found in session"}, status=400)
 
+        # Validate/coerce geofence params here so bad input is a 400, not a
+        # 500 leaked from asyncpg when a raw string/float hits the
+        # DOUBLE PRECISION / INTEGER columns.
+        lat = body.get("latitude")
+        lon = body.get("longitude")
+        radius = body.get("geofence_radius_m")
+        try:
+            lat = None if lat is None else float(lat)
+            lon = None if lon is None else float(lon)
+            radius = None if radius is None else int(radius)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {
+                    "error": "latitude/longitude must be numbers and "
+                    "geofence_radius_m an integer"
+                },
+                status=400,
+            )
+        if (lat is None) != (lon is None):
+            return JSONResponse(
+                {"error": "latitude and longitude must be provided together"},
+                status=400,
+            )
+        if lat is not None and not -90.0 <= lat <= 90.0:
+            return JSONResponse(
+                {"error": "latitude out of range [-90, 90]"}, status=400
+            )
+        if lon is not None and not -180.0 <= lon <= 180.0:
+            return JSONResponse(
+                {"error": "longitude out of range [-180, 180]"}, status=400
+            )
+        if radius is not None and radius <= 0:
+            return JSONResponse(
+                {"error": "geofence_radius_m must be a positive integer"},
+                status=400,
+            )
+
         tenant = self._get_tenant(request)
         try:
             location = await self._venue_service.create_location(
@@ -2171,16 +2211,17 @@ class FormAPIHandler:
                 org_id=org_id,
                 name=str(name),
                 location_type=str(body.get("location_type", "kiosk")),
-                latitude=body.get("latitude"),
-                longitude=body.get("longitude"),
-                geofence_radius_m=body.get("geofence_radius_m"),
+                latitude=lat,
+                longitude=lon,
+                geofence_radius_m=radius,
                 tenant=tenant,
             )
+        except DuplicateVenueError as exc:
+            return JSONResponse({"error": str(exc)}, status=409)
+        except SiteNotFoundError as exc:
+            # Parent site missing or not owned by this org — never a 500.
+            return JSONResponse({"error": str(exc)}, status=404)
         except Exception as exc:
-            from ..services.venue_service import DuplicateVenueError
-
-            if isinstance(exc, DuplicateVenueError):
-                return JSONResponse({"error": str(exc)}, status=409)
             self.logger.exception("create_location failed: %s", exc)
             return JSONResponse({"error": "Internal server error"}, status=500)
 
@@ -2215,11 +2256,9 @@ class FormAPIHandler:
             location = await self._venue_service.get_location(
                 location_id, org_id=org_id, tenant=tenant
             )
+        except LocationNotFoundError as exc:
+            return JSONResponse({"error": str(exc)}, status=404)
         except Exception as exc:
-            from ..services.venue_service import LocationNotFoundError
-
-            if isinstance(exc, LocationNotFoundError):
-                return JSONResponse({"error": str(exc)}, status=404)
             self.logger.exception("get_location failed: %s", exc)
             return JSONResponse({"error": "Internal server error"}, status=500)
 

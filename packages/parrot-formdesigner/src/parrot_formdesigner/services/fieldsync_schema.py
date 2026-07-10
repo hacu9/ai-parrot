@@ -96,7 +96,9 @@ CREATE TABLE IF NOT EXISTS fieldsync.sites (
     is_active   BOOLEAN NOT NULL DEFAULT TRUE,
     inserted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT uq_sites_store_name UNIQUE (store_id, client_id, name)
+    -- org_id leads the UNIQUE so two orgs sharing a store/client namespace
+    -- cannot collide (cross-org 409 name-oracle / name-squatting DoS).
+    CONSTRAINT uq_sites_store_name UNIQUE (org_id, store_id, client_id, name)
 );
 """
 
@@ -115,7 +117,9 @@ CREATE TABLE IF NOT EXISTS fieldsync.locations (
     is_active         BOOLEAN NOT NULL DEFAULT TRUE,
     inserted_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT uq_locations_site_name UNIQUE (site_id, name)
+    -- org_id included as cheap insurance even though site_id is already
+    -- org-unique once create_location enforces site ownership.
+    CONSTRAINT uq_locations_site_name UNIQUE (org_id, site_id, name)
 );
 """
 

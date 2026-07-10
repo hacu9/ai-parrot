@@ -1,25 +1,26 @@
-"""VenueService — CRUD sobre ``fieldsync.sites`` / ``fieldsync.locations``.
+"""VenueService — CRUD over ``fieldsync.sites`` / ``fieldsync.locations``.
 
-Implementa la sub-estructura de tienda de FieldSync (FEAT-330):
-``Store → Site → Location``. ``Store`` es geografía read-only
-(``networkninja.*``, propiedad de FEAT-302); ``Site`` y ``Location`` son
-entidades **propiedad de FieldSync**.
+Implements the FieldSync store sub-structure (FEAT-330):
+``Store → Site → Location``. ``Store`` is read-only geography
+(``networkninja.*``, owned by FEAT-302); ``Site`` and ``Location`` are
+**FieldSync-owned** entities.
 
-- Una ``Site`` agrupa uno o más ``Location`` dentro de un ``Store`` (p. ej.
-  una zona de vending).
-- Una ``Location`` es un **kiosk** o cualquier punto/spot dentro de la tienda.
-  Lleva los parámetros de **geofence** (``latitude`` / ``longitude`` /
-  ``geofence_radius_m``) — el system of record del geofence per-location
-  (movido fuera de ``Event.meta``; ver FEAT-303 §8 y FEAT-318 D5.7). Un
-  ``geofence_radius_m = NULL`` significa geofence deshabilitado en ese punto.
+- A ``Site`` groups one or more ``Location`` inside a ``Store`` (e.g. a
+  vending zone).
+- A ``Location`` is a **kiosk** or any spot/point inside the store. It
+  carries the **geofence** parameters (``latitude`` / ``longitude`` /
+  ``geofence_radius_m``) — the per-location geofence system of record
+  (moved out of ``Event.meta``; see FEAT-303 §8 and FEAT-318 D5.7). A
+  ``geofence_radius_m = NULL`` means geofence disabled at that point.
 
-Diseño (idéntico a ``ProjectService`` — FEAT-302):
-- Pool inyectado en el constructor → testable sin DB real.
-- SQL 100% parametrizado ($1, $2…); nombres de tabla fijados en constantes.
-- **Hard tenant isolation**: todo query filtra ``org_id`` explícitamente.
-- Pydantic v2 para modelos de datos.
+Design (identical to ``ProjectService`` — FEAT-302):
+- Pool injected in the constructor → testable without a real DB.
+- SQL is 100% parametrized ($1, $2…); table names pinned in constants.
+- **Hard tenant isolation**: every query filters ``org_id`` explicitly,
+  and writes verify the parent row belongs to the caller's ``org_id``.
+- Pydantic v2 for data models.
 
-Uso::
+Usage::
 
     svc = VenueService(pool)
     site = await svc.create_site(
@@ -38,7 +39,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -148,9 +149,9 @@ class Location(BaseModel):
     org_id: int
     name: str
     location_type: str = "kiosk"
-    latitude: float | None = None
-    longitude: float | None = None
-    geofence_radius_m: int | None = None
+    latitude: float | None = Field(default=None, ge=-90.0, le=90.0)
+    longitude: float | None = Field(default=None, ge=-180.0, le=180.0)
+    geofence_radius_m: int | None = Field(default=None, gt=0)
     is_active: bool = True
     tenant: str | None = None
 
@@ -179,11 +180,21 @@ WHERE store_id = $1 AND org_id = $2
 ORDER BY site_id
 """
 
+# Ownership-checked insert: the row is written only if the parent site
+# belongs to the caller's org (``WHERE EXISTS`` on ``org_id``). A foreign or
+# non-existent ``site_id`` inserts 0 rows → ``RETURNING`` yields nothing →
+# the service raises ``SiteNotFoundError`` (404), closing the cross-org write
+# / name-oracle / cross-org-cascade hole. site_id is an enumerable SERIAL, so
+# this check is load-bearing, not cosmetic.
 _INSERT_LOCATION_SQL = """
 INSERT INTO fieldsync.locations
     (site_id, client_id, org_id, name, location_type,
      latitude, longitude, geofence_radius_m)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8
+WHERE EXISTS (
+    SELECT 1 FROM fieldsync.sites
+    WHERE site_id = $1 AND org_id = $3
+)
 RETURNING location_id, site_id, client_id, org_id, name, location_type,
           latitude, longitude, geofence_radius_m, is_active
 """
@@ -208,12 +219,20 @@ _UNIQUE_VIOLATION_CODE = "23505"
 
 
 def _is_unique_violation(exc: Exception) -> bool:
-    """Return True when ``exc`` looks like a Postgres UNIQUE violation."""
-    exc_str = str(exc)
+    """Return True when ``exc`` is a Postgres UNIQUE violation (SQLSTATE 23505).
+
+    Prefers the structured ``sqlstate`` attribute asyncpg sets on
+    ``UniqueViolationError`` — the authoritative signal. Falls back to the
+    error-code string and the exception's type name only for drivers/fakes
+    that don't expose ``sqlstate``. The loose ``"unique" in str(exc)``
+    substring was dropped: any unrelated error whose message merely contained
+    the word "unique" was being misreported as a 409 duplicate.
+    """
+    if getattr(exc, "sqlstate", None) == _UNIQUE_VIOLATION_CODE:
+        return True
     return (
-        "unique" in exc_str.lower()
-        or _UNIQUE_VIOLATION_CODE in exc_str
-        or "UniqueViolation" in type(exc).__name__
+        _UNIQUE_VIOLATION_CODE in str(exc)
+        or "uniqueviolation" in type(exc).__name__.lower()
     )
 
 
@@ -383,6 +402,9 @@ class VenueService:
 
         Raises:
             DuplicateVenueError: If ``(site_id, name)`` already exists.
+            SiteNotFoundError: If ``site_id`` does not exist in ``org_id``
+                (the ownership ``WHERE EXISTS`` matched no row) — surfaced as
+                404 so an actor cannot attach locations to another org's site.
         """
         async with self._pool.acquire() as conn:
             try:
@@ -402,6 +424,9 @@ class VenueService:
                     raise DuplicateVenueError("location", name) from exc
                 raise
 
+        if row is None:
+            # 0 rows inserted → parent site not owned by this org (or missing).
+            raise SiteNotFoundError(site_id)
         return self._row_to_location(row, tenant=tenant)
 
     async def get_location(
